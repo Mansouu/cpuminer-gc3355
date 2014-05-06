@@ -42,7 +42,7 @@
 #define PROGRAM_NAME		"minerd"
 #define DEF_RPC_URL		"http://127.0.0.1:9332/"
 
-#define MINER_VERSION	"v0.9d"
+#define MINER_VERSION	"v0.9e"
 
 enum workio_commands {
 	WC_SUBMIT_WORK,
@@ -85,6 +85,7 @@ static const char *algo_names[] = {
 struct gc3355_dev {
 	int	id;
 	int	dev_fd;
+	unsigned char type;
 	unsigned char chips;
 	bool resend;
 	char *devname;
@@ -111,6 +112,7 @@ static unsigned short opt_frequency = 600;
 static char *opt_gc3355_frequency = NULL;
 static char opt_gc3355_autotune = 0x0;
 static unsigned short opt_gc3355_chips = GC3355_DEFAULT_CHIPS;
+static unsigned int opt_gc3355_timeout = 0;
 static struct gc3355_dev *gc3355_devs;
 static unsigned int gc3355_time_start;
 
@@ -169,6 +171,7 @@ Options:\n\
 	  --gc3355-freq=DEV0:F0:CHIP0,...,DEVn:Fn:CHIPn		individual per chip frequency setting\n\
   -A, --gc3355-autotune  								auto overclocking each GC3355 chip (default: no)\n\
   -c, --gc3355-chips=N  								# of GC3355 chips (default: 5)\n\
+  -x, --gc3355-timeout=N  								max. time after no share is submitted before restarting GC3355 chips (default: never)\n\
   -a, --api-port=PORT  									set the JSON API port (default: 4028)\n\
   -t, --text											disable curses tui, output text\n\
   -L, --log												file logging\n\
@@ -196,6 +199,7 @@ static struct option const options[] = {
 	{ "gc3355-freq", 1, NULL, 'f' },
 	{ "gc3355-autotune", 0, NULL, 'A' },
 	{ "gc3355-chips", 1, NULL, 'c' },
+	{ "gc3355-timeout", 1, NULL, 'x' },
 	{ "api-port", 1, NULL, 'a' },
 	{ "text", 0, NULL, 't' },
 	{ "log", 0, NULL, 'L' },
@@ -223,6 +227,27 @@ struct work {
 	unsigned short thr_id;
 };
 
+struct work_data
+{
+	uint32_t nonce;
+	unsigned short thr_id;
+};
+
+struct work_item
+{
+	uint32_t work_id;
+	struct work_data *work_data;
+	struct work_item *next;
+	struct work_item *prev;
+};
+
+struct work_items
+{
+	struct work_item *head;
+	int size;
+	uint32_t id;
+};
+
 static uint32_t g_prev_target[8];
 static uint32_t g_curr_target[8];
 static char g_prev_job_id[128];
@@ -234,6 +259,81 @@ static char can_work = 0x1;
 static struct work *g_works;
 static time_t g_work_time;
 static pthread_mutex_t g_work_lock;
+
+static struct work_items *work_items;
+static pthread_mutex_t work_items_lock;
+
+static struct work_items* init_work_items()
+{
+	struct work_items *items = calloc(1, sizeof(struct work_items));
+	items->size = 0;
+	items->id = 0xf00;
+	return items;
+}
+
+static struct work_data* pop_work_item(struct work_items *items, uint32_t work_id)
+{
+	int i;
+	struct work_item *item;
+	struct work_item *prev;
+	struct work_data *work_data = NULL;
+	for(i = 0, item = items->head; i < items->size - 1; i++)
+	{
+		if(item->work_id == work_id) break;
+		item = item->next;
+	}
+	if(item != NULL && item->work_id == work_id)
+	{
+		work_data = item->work_data;
+		if(item == items->head)
+		{
+			if(items->size <= 1)
+				items->head = NULL;
+			else
+			{
+				items->head = item->next;
+				item->next->prev = NULL;
+			}
+		}
+		else
+		{
+			prev = item->prev;
+			prev->next = item->next;
+		}
+		free(item);
+		items->size--;
+	}
+	return work_data;
+}
+
+static uint32_t push_work_item(struct work_items *items, struct work *work)
+{
+	int i;
+	struct work_item *item;
+	struct work_item *new;
+	struct work_data *work_data;
+	work_data = pop_work_item(items, items->id);
+	if(work_data != NULL)
+		free(work_data);
+	new = calloc(1, sizeof(struct work_item));
+	work_data = calloc(1, sizeof(struct work_data));
+	work_data->nonce = work->data[19];
+	work_data->thr_id = work->thr_id;
+	new->work_data = work_data;
+	new->work_id = items->id;
+	if(items->head == NULL)
+		items->head = new;
+	else
+	{
+		for(i = 0, item = items->head; i < items->size - 1; i++)
+			item = item->next;
+		item->next = new;
+		item->next->prev = item;
+	}
+	items->size++;
+	items->id = (++items->id & 0xfff) | 0xf00;
+	return new->work_id;
+}
 
 static bool submit_work(struct thr_info *thr, const struct work *work_in);
 
@@ -586,15 +686,26 @@ err_out:
 	return false;
 }
 
-static void share_result(int result, const char *reason, int thr_id, int chip_id)
+static void share_result(int result, const char *reason, uint32_t work_id)
 {
-	int i, j;
+	int chip_id, thr_id;
 	struct timeval timestr;
+	struct work_data *work_data;
+	pthread_mutex_lock(&work_items_lock);
+	work_data = pop_work_item(work_items, work_id);
+	pthread_mutex_unlock(&work_items_lock);
+	if(work_data == NULL)
+	{
+		applog(LOG_ERR, "Invalid work_id: %x", work_id);
+		return;
+	}
+	thr_id = work_data->thr_id;
+	chip_id = work_data->nonce / (0xffffffff / gc3355_devs[thr_id].chips);
 	pthread_mutex_lock(&stats_lock);
 	if(result)
 	{
 		gc3355_devs[thr_id].accepted[chip_id]++;
-		if(opt_gc3355_autotune && gc3355_devs[thr_id].adjust[chip_id] > 0)
+		if(opt_gc3355_autotune && gc3355_devs[thr_id].type == 1 && gc3355_devs[thr_id].adjust[chip_id] > 0)
 		{
 			gc3355_devs[thr_id].autotune_accepted[chip_id]++;
 		}
@@ -607,11 +718,12 @@ static void share_result(int result, const char *reason, int thr_id, int chip_id
 	pthread_mutex_unlock(&stats_lock);
 	applog(LOG_INFO, "%s %08x GSD %d@%d",
 	   result ? "Accepted" : "Rejected",
-	   gc3355_devs[thr_id].last_nonce[chip_id],
+	   work_data->nonce,
 	   thr_id, chip_id
 	);
 	if (reason)
 		applog(LOG_INFO, "DEBUG: reject reason: %s", reason);
+	free(work_data);
 }
 
 static void restart_threads(void)
@@ -626,6 +738,7 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	json_t *val, *res, *reason;
 	char s[345];
 	int i;
+	uint32_t id;
 	bool rc = false;
 
 	if (have_stratum) {
@@ -639,10 +752,12 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		ntimestr = bin2hex((const unsigned char *)(&ntime), 4);
 		noncestr = bin2hex((const unsigned char *)(&nonce), 4);
 		xnonce2str = bin2hex(work->xnonce2, 4);
-		int chip_id = work->data[19] / (0xffffffff / gc3355_devs[work->thr_id].chips);
+		pthread_mutex_lock(&work_items_lock);
+		id = push_work_item(work_items, work);
+		pthread_mutex_unlock(&work_items_lock);
 		sprintf(s,
 			"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":%d}",
-			rpc_user, work->job_id, xnonce2str, ntimestr, noncestr, chip_id << 8 | work->thr_id);
+			rpc_user, work->job_id, xnonce2str, ntimestr, noncestr, id);
 		free(ntimestr);
 		free(noncestr);
 		free(xnonce2str);
@@ -886,9 +1001,9 @@ static bool stratum_handle_response(char *buf)
 		goto out;
 	}
 
-	int res_id = (int) json_integer_value(id_val);
+	uint32_t res_id = (uint32_t) json_integer_value(id_val);
 	share_result(json_is_true(res_val),
-		err_val ? json_string_value(json_array_get(err_val, 1)) : NULL, res_id & 0xff, res_id >> 8);
+		err_val ? json_string_value(json_array_get(err_val, 1)) : NULL, res_id);
 
 	ret = true;
 out:
@@ -1200,6 +1315,9 @@ static void parse_arg (int key, char *arg)
 	case 'c':
 		opt_gc3355_chips = atoi(arg);
 		break;
+	case 'x':
+		opt_gc3355_timeout = atoi(arg);
+		break;
 	case 'a':
 		opt_api_port = atoi(arg);
 		break;
@@ -1396,6 +1514,7 @@ int main(int argc, char *argv[])
 	pthread_mutex_init(&g_work_lock, NULL);
 	pthread_mutex_init(&stratum.sock_lock, NULL);
 	pthread_mutex_init(&stratum.work_lock, NULL);
+	pthread_mutex_init(&work_items_lock, NULL);
 
 #ifndef WIN32
 	signal(SIGHUP, signal_handler);
@@ -1436,6 +1555,8 @@ int main(int argc, char *argv[])
 	struct gc3355_dev devs[opt_n_threads];
 	memset(&devs, 0, sizeof(devs));
 	gc3355_devs = devs;
+	
+	work_items = init_work_items();
 
 	if (!rpc_userpass) {
 		rpc_userpass = malloc(strlen(rpc_user) + strlen(rpc_pass) + 2);
